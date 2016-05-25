@@ -10,7 +10,7 @@ Project for the Python Programming Course 2016 @ FMI
 
 ###Optional Functionality:
   * Seeding
-    * ###Uploading
+    * ### Uploading
   * Magnet links
 
 
