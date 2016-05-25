@@ -1,5 +1,16 @@
 # BitTorrent-Client
-Project for the Python Programming Course 2016 @ FMI
+##Project for the Python Programming Course 2016 @ FMI
+
+###Main Functionality:
+  * Downloading
+  * Uploading
+  * GUI
+  * Port configuration
+  * Different layouts of downloads/uploads
+  * Adequate progress bar
+
+###Optional Functionality:
+  * Magnet links
 
 За проверяващите от Python курса:
 
