@@ -1,14 +1,13 @@
 import random
 import hashlib
 from collections import OrderedDict
-import bencoder
 
 
 class UnrecognizedTokenError(Exception):
     pass
 
 
-class OrderedDecoder:
+class BaseDecoderEncoder:
 
     LIST = b'l'
     INT = b'i'
@@ -18,32 +17,41 @@ class OrderedDecoder:
     SEP = b':'
 
     tokens = {
-        'list': lambda x: x == OrderedDecoder.LIST,
-        'int': lambda x: x == OrderedDecoder.INT,
-        'str': lambda x: x in OrderedDecoder.STR,
-        'dict': lambda x: x == OrderedDecoder.DICT,
-        'end': lambda x: x == OrderedDecoder.END,
-        'sep': lambda x: x == OrderedDecoder.SEP
+        'list': lambda x: x == BaseDecoderEncoder.LIST,
+        'int': lambda x: x == BaseDecoderEncoder.INT,
+        'str': lambda x: x in BaseDecoderEncoder.STR,
+        'dict': lambda x: x == BaseDecoderEncoder.DICT,
+        'end': lambda x: x == BaseDecoderEncoder.END,
+        'sep': lambda x: x == BaseDecoderEncoder.SEP
     }
+
+    encode_info = {
+        list: (b'l', b'e'),
+        bytes: (b'', b''),
+        OrderedDict: (b'd', b'e'),
+    }
+
+    def __init__(self, data):
+        self._data = data
+        self.index = 0
+
+    @property
+    def data(self):
+        return self._data
+
+
+class OrderedDecoder(BaseDecoderEncoder):
 
     def __init__(self, data):
         if not isinstance(data, (bytes, bytearray)):
             raise RuntimeError('Input data must be bytes.')
-        self._data = data
+        super().__init__(data)
         self.decoded_data = OrderedDict()
-        self.index = 0
 
     def get_token_type(self, token):
         for tk in self.tokens:
             if self.tokens[tk](token):
                 return tk
-
-    def check_token(self, token, symbol):
-        return self.tokens[token](symbol)
-
-    @property
-    def data(self):
-        return self._data
 
     def decode_list(self, res_list=None):
         """Method for list decoding"""
@@ -116,8 +124,8 @@ class OrderedDecoder:
         element = self.data[self.index: self.index + 1]
         token = self.get_token_type(element)
         if token:
-            if token == 'sep':
-                getattr(self, 'decode_{}'.format(token))()
+            if token == BaseDecoderEncoder.SEP:
+                self.decode_sep()
                 return self.decode_current_token()
             return getattr(self, 'decode_{}'.format(token))()
         raise UnrecognizedTokenError
@@ -127,17 +135,50 @@ class OrderedDecoder:
         return self.decode_current_token()
 
 
+class OrderedEncoder(BaseDecoderEncoder):
+
+    def encode(self):
+        return self.encode_entity(self.data)
+
+    def encode_entity(self, ent):
+        if type(ent) is bytes and all(el in b'0123456789' for el in ent):
+            return b'i' + ent + b'e'
+        else:
+            start_b, end_b = self.encode_info[type(ent)]
+            data = b''
+            if type(ent) is OrderedDict:
+                for key, val in ent.items():
+                    data += self.encode_entity(key)
+                    data += self.encode_entity(val)
+            elif type(ent) is list:
+                for el in ent:
+                    data += self.encode_entity(el)
+            else:
+                return str(len(ent)).encode('utf-8') + b':' + ent
+            return start_b + data + end_b
+
+
 class Torrent:
 
     def __init__(self, torrent):
         self.torrent = torrent
         self.data = self.decode_torrent()
-        print(self.data)
+        self.bhash_info = self.encode_torrent(self.data[b'info'])
+        # print(self.data)
 
     def decode_torrent(self):
         """Returns decoded torrent metainfo as python types"""
         with open(self.torrent, 'rb') as fd:
             return OrderedDecoder(fd.read()).decode()
+
+    def decode_chunks(self, data):
+        return OrderedDecoder(data).decode()
+
+    def encode_torrent(self, data):
+        return OrderedEncoder(data).encode()
+
+    def get_files_length(self):
+        return sum(int(x[b'length']) for x in self.data[b'info'][b'files'])
 
     @staticmethod
     def key_search(key, data):
@@ -148,8 +189,8 @@ class Torrent:
         for k in data:
             if type(data[k]) == dict:
                 return Torrent.key_search(key, data[k])
-        else:
-            return None
+
+        return None
 
     def __getattr__(self, attr):
         try:
@@ -176,8 +217,7 @@ class Torrent:
     @property
     def tracker_info_header(self):
         """Returns torrent related info for tracker connection"""
-        print(self.info)
-        info_hash = hashlib.sha1(bencoder.encode(self.info)).hexdigest()
+        info_hash = hashlib.sha1(self.bhash_info).digest()
         peer_id = '-PC0001-' + ''.join(str(random.randint(0, 9))
                                        for _ in range(12))
 
