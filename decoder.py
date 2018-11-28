@@ -138,9 +138,11 @@ class OrderedDecoder(BaseDecoderEncoder):
 class OrderedEncoder(BaseDecoderEncoder):
 
     def encode(self):
+        """Encoding symbolic start method"""
         return self.encode_entity(self.data)
 
     def encode_entity(self, ent):
+        """The real encoding deal"""
         if type(ent) is bytes and all(el in b'0123456789' for el in ent):
             return b'i' + ent + b'e'
         else:
@@ -164,6 +166,20 @@ class Torrent:
         self.torrent = torrent
         self.data = self.decode_torrent()
         self.bhash_info = self.encode_torrent(self.data[b'info'])
+
+        self._downloaded = 0
+        self._uploaded = 0
+        self._data_left = self.get_files_length()
+        self.sha_pieces = {
+            ind: self.info[b'pieces'][i: i + 20]
+            for ind, i in enumerate(
+                range(0, len(self.info[b'pieces']), 20)
+            )
+        }
+        self.actual_data = {
+            piece_ind: bytearray() for
+            piece_ind in self.piece_length
+        }
         # print(self.data)
 
     def decode_torrent(self):
@@ -224,4 +240,24 @@ class Torrent:
         return {
             'info_hash': info_hash,
             'peer_id': peer_id,
+            'uploaded': self.uploaded,
+            'downloaded': self.downloaded,
+            'left': self.left,
         }
+
+    @property
+    def downloaded(self):
+        return self._downloaded
+
+    @property
+    def uploaded(self):
+        return self._uploaded
+
+    @property
+    def left(self):
+        return self._data_left
+
+    def verify_piece(self, piece, piece_ind):
+        """Verify assembled piece integrity"""
+        assert hashlib.sha1(piece).digest == self.sha_pieces[piece_ind]
+
