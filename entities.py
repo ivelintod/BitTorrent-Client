@@ -54,7 +54,9 @@ class Peer:
         self.ip = ip
         self.port = port
         self._is_valid = None
+        self.bitmap = None
         self.connection_attempts = 0
+        self.errors = set()
         if not sock:
             self.sock = self.create_client_socket()
         else:
@@ -74,6 +76,7 @@ class Peer:
     def reset(self):
         self._is_valid = None
         self.connection_attempts = 0
+        self.sock = self.create_client_socket()
 
     def connect(self, timeout=None):
         if timeout:
@@ -89,6 +92,7 @@ class Peer:
             if self.connection_attempts == self.MAX_CONN_ATTEMPTS:
                 self.sock.close()
                 self._is_valid = False
+                self.errors.add(str(e))
             else:
                 # print('Attempting once more...')
                 self.sock.close()
@@ -99,15 +103,15 @@ class Peer:
             self._is_valid = True
 
     def recv(self, msg_len=5):
-        # data = b''
-        # while True:
-        #     print('receiving')
-        #     more = self.sock.recv(0xff)
-        #     print('done')
-        #     if not more:
-        #         return data
-        #     data += more
-        return self.sock.recv(msg_len)
+        data = b''
+        while len(data) < msg_len:
+            more = self.sock.recv(msg_len - len(data))
+            if not more:
+                print('INCOMPLETE DATA!')
+                return data
+            data += more
+        return data
+        # return self.sock.recv(msg_len)
 
     def send(self, msg):
         self.sock.sendall(msg)
@@ -142,7 +146,7 @@ class Tracker:
         self.port = port
         self.compact = compact
         self.session = requests.Session()
-        self.session.mount('http://', SourcePortAdapter(self.port))
+        # self.session.mount('http://', SourcePortAdapter(self.port))
 
     @property
     def tracker_header(self):
@@ -364,7 +368,6 @@ class PeerLoop(threading.Thread):
         self.peer_messages = get_torrent_msg_rel()
         self.processed_peers = {}
         self.message_queues = {}
-        self.peer_buffers = {}
         self.peer_msg_rel = {}
         self._terminate = False
         super().__init__()
@@ -389,140 +392,101 @@ class PeerLoop(threading.Thread):
             if peer_sock in sock_list:
                 sock_list.remove(peer_sock)
 
+    def process_reading_sockets(self, read_sockets, *write_err_sockets):
+        for peer_sock in read_sockets:
+            peer = self.processed_peers[peer_sock]
+
+            msg = self.peer_msg_rel[peer]
+
+            try:
+                if msg and msg.msg_len:
+                    print(msg.msg_len)
+                    resp = peer.recv(msg.msg_len)
+                    first = False
+                else:
+                    resp = peer.recv()
+                    first = True
+            except socket.error as e:
+                print('Erroneous client', str(e))
+                self.runtime_removal(peer_sock, *write_err_sockets)
+                continue
+
+            time.sleep(0.5)
+            print(peer_sock, 'delegating')
+            print('first', msg.msg_buffer if msg else None)
+            print('resp', resp)
+
+            if not msg or not msg.msg_buffer:
+                try:
+                    msg_instance = self.peer_messages.delegate(resp)
+                    if not msg_instance:
+                        self.runtime_removal(peer_sock, *write_err_sockets)
+                        continue
+                    self.peer_msg_rel[peer] = msg_instance
+                    msg = msg_instance
+                    print('MSG LEN', msg_instance.msg_len)
+                except Exception:
+                    print('Exception occurred', traceback.format_exc())
+                    self.runtime_removal(peer_sock, *write_err_sockets)
+                    continue
+
+            msg.msg_buffer += resp
+
+            if len(msg.msg_buffer) == msg.initial_len + 4:
+                is_valid, reply_type = msg.decode()
+                if is_valid and reply_type:
+                    self.message_queues[peer].put(reply_type)
+                else:
+                    self.runtime_removal(peer_sock, *write_err_sockets)
+                print('second', msg.msg_buffer)
+                msg.complete_msg = msg.msg_buffer[:]
+                msg.msg_buffer = bytearray()
+                print('SUCCESS')
+
+            if first:
+                msg.msg_len -= 1
+            else:
+                msg.msg_len -= len(resp)
+
+    def process_writing_sockets(self, write_sockets, error_sockets):
+
+        for peer_sock in write_sockets:
+            peer = self.processed_peers[peer_sock]
+            msg_queue = self.message_queues[peer]
+            if not msg_queue.empty():
+                msg_type = msg_queue.get_nowait()
+                msg_inst = msg_type()
+            else:
+                try:
+                    peer.send(Handshake(self.peer_messages.peer_id,
+                                        self.peer_messages.info_hash).encode())
+                    peer.send(Interested().encode())
+                    peer.send(Request().encode())
+                except socket.error as e:
+                    print('There was an exception:', str(e))
+                    self.runtime_removal(peer_sock, error_sockets)
+
+            # if not is_valid:
+            #     self.runtime_removal(peer_sock, err)
+            #     continue
+            # if payload:
+            #     data_to_send = msg.next_msg()
+
+            time.sleep(1)
+
     def peer_communication_handler(self):
-        handshake = Handshake(self.peer_messages.peer_id,
-                              self.peer_messages.info_hash)
-        interested = Interested()
-        request = Request()
-        handshake_sent_peers = set()
         print('starteeeed')
 
         while not self._terminate:
             read, write, err = select.select(self.processed_peers.keys(),
                                              self.processed_peers.keys(),
                                              [], 0.1)
-            for peer_sock in read:
-                peer = self.processed_peers[peer_sock]
 
-                msg = self.peer_msg_rel[peer]
-
-                try:
-                    if msg and msg.msg_len:
-                        print(msg.msg_len)
-                        resp = peer.recv(msg.msg_len)
-                        first = False
-                    else:
-                        resp = peer.recv()
-                        first = True
-                except socket.error as e:
-                    print('Erroneous client', str(e))
-                    self.runtime_removal(peer_sock, write, err)
-                    continue
-
-                time.sleep(0.5)
-                print(peer_sock, 'delegating')
-                print('first', msg.msg_buffer if msg else None)
-                print('resp', resp)
-
-                if not msg or not msg.msg_buffer:
-                    try:
-                        msg_instance = self.peer_messages.delegate(resp)
-                        if not msg_instance:
-                            self.runtime_removal(peer_sock, write, err)
-                            continue
-                        self.peer_msg_rel[peer] = msg_instance
-                        print('MSG LEN', msg_instance.msg_len)
-                    except Exception:
-                        print('Exception occurred', traceback.format_exc())
-
-                msg.msg_buffer += resp
-
-                if len(msg.msg_buffer) == msg.initial_len + 4:
-                    self.message_queues[peer].put(msg)
-                    print('second', msg.msg_buffer)
-                    msg.msg_buffer = bytearray()
-                    print('SUCCESS')
-
-                if msg:
-                    if first:
-                        msg.msg_len -= 1
-                    else:
-                        msg.msg_len -= len(resp)
-
-            for peer_sock in write:
-                peer = self.processed_peers[peer_sock]
-                msg_queue = self.message_queues[peer]
-                if not msg_queue.empty():
-                    msg = msg_queue.get_nowait()
-                else:
-                    continue
-
-                is_valid, info = msg.decode(msg.msg_buffer)
-                if not is_valid:
-                    self.runtime_removal(peer_sock, err)
-                    continue
-
-                try:
-                    if peer not in handshake_sent_peers:
-                        peer.send(handshake.encode())
-                        handshake_sent_peers.add(peer)
-                        continue
-                    peer.send(interested.encode())
-                    peer.send(request.encode())
-                except socket.error as e:
-                    print('There was an exception:', str(e))
-                    self.runtime_removal(peer_sock)
-                time.sleep(2)
+            self.process_reading_sockets(read, write, err)
+            self.process_writing_sockets(write, err)
 
             for peer in err:
                 print('Erroneous peer', peer)
-
-
-    def peer_message_handler(self):
-        while not self._terminate:
-            msg = self.message_queues
-
-
-
-        # peer.send(handshake.encode())
-        # inp, _, _ = select.select([peer.sock], [], [], 10)
-        # print('Inp1: ', inp)
-        # if not inp:
-        #     return
-
-        # resp = peer.recvall()
-        # print(resp)
-        # if not handshake.decode(resp):
-        #     print('Peer({} {}) is fishy!'.format(peer.ip, peer.port))
-        #     return
-
-        # while True:
-        #     interested = Interested(self.peer_messages.peer_id,
-        #                             self.peer_messages.info_hash)
-        #     peer.send(interested.encode())
-        #     inp, _, _ = select.select([peer.sock], [], [], 10)
-        #     print('Inp2: ', inp)
-        #     # if not inp:
-        #         # return
-
-        #     resp = peer.recvall()
-        #     print('Resp', resp)
-        #     if not resp:
-        #         print('Peer connection broken')
-        #         break
-
-
-        #     request = Request(self.peer_messages.peer_id,
-        #                       self.peer_messages.info_hash)
-        #     peer.send(request.encode())
-
-        #     inp, _, _ = select.select([peer.sock], [], [], 10)
-        #     print('Inp3: ', inp)
-        #     resp = peer.recvall()
-        #     print('Data: ', resp)
-        #     if not resp:
-        #         print('Peer connection broken')
-        #         break
 
     def _reader_loop(self):
         while not self._terminate:
@@ -554,12 +518,20 @@ class PeerMessage:
         b'\x13': 'Handshake'
     }
 
+    msg_reply_types = {
+        'Handshake': 'Handshake',
+        'Bitfield': 'Request',
+        'Have': 'Request',
+        'Request': 'Piece'
+    }
+
     def __init__(self, peer_id=None, info_hash=None):
         self.peer_id = peer_id
         self.info_hash = info_hash
         self.initial_len = None
         self.msg_len = None
         self.msg_buffer = bytearray()
+        self.complete_msg = bytearray()
 
     @staticmethod
     def get_len(msg):
@@ -589,13 +561,26 @@ class PeerMessage:
         clz_instance.initial_len = clz.get_len(msg)
         return clz_instance
 
+    def encode(self, *args, **kwargs):
+        """Encode messages of our own before sending"""
+        raise NotImplementedError
 
-    def decode(self, msg):
+    def decode(self, *args, **kwargs):
         """Deal with incoming msg response"""
+        raise NotImplementedError
+
+    def next_step(self, *args, **kwargs):
+        """Determine the next message type to send"""
+        # cls_name = self.msg_reply_types[type(self)]
+        # return globals().get(cls_name, None)
         raise NotImplementedError
 
 
 class Handshake(PeerMessage):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.handshake_sent = False
 
     def encode(self):
         pstrlen = struct.pack('!B', 19)
@@ -606,10 +591,16 @@ class Handshake(PeerMessage):
         )
         return handshake
 
-    def decode(self, msg):
-        if not msg[28: 48] == self.encode()[28: 48]:
+    def decode(self, *args, **kwargs):
+        if not self.complete_msg[28: 48] == self.encode()[28: 48]:
             return False, None
-        return True, None
+        return True, lambda: self.next_step()
+
+    def next_step(self, *args, **kwargs):
+        if not self.handshake_sent:
+            self.handshake_sent = True
+            return self.encode()
+        return Request
 
     @staticmethod
     def get_len(msg):
@@ -621,10 +612,14 @@ class KeepAlive(PeerMessage):
     def encode(self):
         return struct.pack('!I', 0)
 
-    def decode(self, msg):
-        if msg[3:4] == b'\x00':
-            return True, msg[1:]
-        return False, None
+    def decode(self, *args, **kwargs):
+        # if self.complete_msg[3:4] == b'\x00':
+        #     return True, self.complete_msg[1:]
+        # return False, None
+        return True, self.complete_msg[1:]
+
+    def next_step(self, *args, **kwargs):
+        pass
 
 
 class Choke(PeerMessage):
@@ -632,10 +627,14 @@ class Choke(PeerMessage):
     def encode(self):
         return struct.pack('!IB', 1, 0)
 
-    def decode(self, msg):
-        if msg[:2] == b'\x01\x00':
-            return True, msg[2:]
-        return False, None
+    def decode(self, *args, **kwargs):
+        # if self.complete_msg[:2] == b'\x01\x00':
+        #     return True, self.complete_msg[2:]
+        # return False, None
+        return True, self.complete_msg[2:]
+
+    def next_step(self, *args, **kwargs):
+        pass
 
 
 class Unchoke(PeerMessage):
@@ -643,10 +642,14 @@ class Unchoke(PeerMessage):
     def encode(self):
         return struct.pack('!IB', 1, 1)
 
-    def decode(self, msg):
-        if msg[:2] == b'\x01\x01':
-            return True, msg[2:]
-        return False, None
+    def decode(self, *args, **kwargs):
+        # if self.complete_msg[:2] == b'\x01\x01':
+        #     return True, self.complete_msg[2:]
+        # return False, None
+        return True, self.complete_msg[2:]
+
+    def next_step(self, *args, **kwargs):
+        pass
 
 
 class Interested(PeerMessage):
@@ -654,10 +657,14 @@ class Interested(PeerMessage):
     def encode(self):
         return struct.pack('!IB', 1, 2)
 
-    def decode(self, msg):
-        if msg[:2] == b'\x01\x02':
-            return True, msg[2:]
-        return False, None
+    def decode(self, *args, **kwargs):
+        # if self.complete_msg[:2] == b'\x01\x02':
+        #     return True, self.complete_msg[2:]
+        # return False, None
+        return True, self.complete_msg[2:]
+
+    def next_step(self, *args, **kwargs):
+        pass
 
 
 class NotInterested(PeerMessage):
@@ -665,10 +672,14 @@ class NotInterested(PeerMessage):
     def encode(self):
         return struct.pack('!IB', 1, 3)
 
-    def decode(self, msg):
-        if msg[:2] == b'\x01\x03':
-            return True, msg[2:]
-        return False, None
+    def decode(self, *args, **kwargs):
+        # if self.complete_msg[:2] == b'\x01\x03':
+        #     return True, self.complete_msg[2:]
+        # return False, None
+        return True, self.complete_msg[2:]
+
+    def next_step(self, *args, **kwargs):
+        pass
 
 
 class Have(PeerMessage):
@@ -678,8 +689,13 @@ class Have(PeerMessage):
         payload = struct.pack('!I', piece_index)
         return len_id + payload
 
-    def decode(self, msg):
-        _, _, index = struct.unpack('!IBI', msg)
+    def decode(self, *args, **kwargs):
+        _, _, index = struct.unpack('!IBI', self.complete_msg)
+        return True, lambda: self.next_step(index)
+
+    def next_step(self, piece_ind):
+        # TODO: let's continue from here, shall we
+        return Request(piece_ind)
 
 
 class Bitfield(PeerMessage):
@@ -688,19 +704,33 @@ class Bitfield(PeerMessage):
         len_id = struct.pack('!IB', len(bitfield) + 1, 5)
         return len_id
 
-    def decode(self, msg):
-        pass
+    def decode(self, *args, **kwargs):
+        bitmap = ''.join(bin(x) for x in self.complete_msg[5:]).replace('0b', '')
+        bitmap = {ind: bool(int(val)) for ind, val in enumerate(bitmap)}
+        return True, bitmap
+
+    def next_msg(self):
+        return Request().encode()
 
 
 class Request(PeerMessage):
 
+    def __init__(self, piece_ind=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.piece_ind = piece_ind
+
     def encode(self, index=0, begin=0, length=2**14):
+        if self.piece_ind is not None:
+            index = self.piece_ind
         len_id = struct.pack('!IB', 13, 6)
         payload = struct.pack('!III', index, begin, length)
         return len_id + payload
 
     def decode(self, msg):
         _, _, index, begin, length = struct.unpack('!IBIII', msg)
+
+    def next_step(self, *args, **kwargs):
+        pass
 
 
 class Piece(PeerMessage):
@@ -711,10 +741,10 @@ class Piece(PeerMessage):
         return len_id + payload
 
     def decode(self, msg):
-        _, _, index, begin = struct.unpack('!IBIII', msg[:13])
+        _, _, index, begin = struct.unpack('!IBII', msg[:13])
         block = msg[13:]
 
 
 if __name__ == '__main__':
-    c = Client(sys.argv[1])
+    c = Client('/home/ivelin/Downloads/All.She.Wrote.2018.WEB-DL.x264.AAC-REFLUX.torrent')
     c.start()

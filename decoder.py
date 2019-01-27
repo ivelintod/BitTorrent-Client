@@ -1,5 +1,6 @@
 import random
 import hashlib
+import threading
 from collections import OrderedDict
 
 
@@ -160,6 +161,64 @@ class OrderedEncoder(BaseDecoderEncoder):
             return start_b + data + end_b
 
 
+class Block:
+    """Integral part of the piece as a whole"""
+
+    MISSING = 1
+    INCOMPLETE = 2
+    COMPLETE = 3
+
+    def __init__(self, length, offset):
+        self.length = length
+        self.offset = offset
+        self.state = self.MISSING
+        self.data = bytearray()
+
+    def fill_block_with_data(self, data: bytes):
+        self.data.extend(data)
+        if len(self.data) == self.length:
+            self.state = self.COMPLETE
+        else:
+            self.state = self.INCOMPLETE
+
+
+class Piece:
+    """A sum of a number of blocks"""
+
+    REQ_SIZE = 2**14  # 16KB block (stated as optimal in wiki)
+
+    def __init__(self, length):
+        self.append_lock = threading.Lock()
+        self.length = length
+        if self.length % self.REQ_SIZE:
+            self.nr_blocks = self.length // self.REQ_SIZE + 1
+        else:
+            self.nr_blocks = self.length // self.REQ_SIZE
+        self.blocks = [Block(self.REQ_SIZE, self.REQ_SIZE * i) for i in range(self.nr_blocks)]
+        self.left = self.length
+        self.is_complete = False
+
+    def missing_blocks(self):
+        return {block for block in self.blocks if block.state == block.MISSING}
+
+    def pending_blocks(self):
+        return {block for block in self.blocks if block.state == block.PENDING}
+
+    def is_complete(self):
+        return all(block.state == block.COMPLETE for block in self.blocks)
+
+    def append_data(self, data: bytes):
+        with self.append_lock:
+            self.data.extend(data)
+            self.offset += len(data)
+            self.left -= len(data)
+            if self.offset == self.length:
+                self.is_complete = True
+                return
+            if self.left < self.req_size:
+                self.req_size = self.left
+
+
 class Torrent:
 
     def __init__(self, torrent):
@@ -177,10 +236,13 @@ class Torrent:
             )
         }
         self.actual_data = {
-            piece_ind: bytearray() for
+            piece_ind: Piece(int(self.info[b'piece length'])) for
             piece_ind in self.piece_length
         }
         # print(self.data)
+
+    def get_piece_info_for_request(self):
+        pass
 
     def decode_torrent(self):
         """Returns decoded torrent metainfo as python types"""
