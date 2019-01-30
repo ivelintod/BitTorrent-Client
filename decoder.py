@@ -1,3 +1,4 @@
+import queue
 import random
 import hashlib
 import threading
@@ -165,7 +166,7 @@ class Block:
     """Integral part of the piece as a whole"""
 
     MISSING = 1
-    INCOMPLETE = 2
+    PROCESSING = 2
     COMPLETE = 3
 
     def __init__(self, length, offset):
@@ -175,11 +176,11 @@ class Block:
         self.data = bytearray()
 
     def fill_block_with_data(self, data: bytes):
-        self.data.extend(data)
         if len(self.data) == self.length:
+            self.data.extend(data)
             self.state = self.COMPLETE
         else:
-            self.state = self.INCOMPLETE
+            self.state = self.MISSING
 
 
 class Piece:
@@ -187,14 +188,18 @@ class Piece:
 
     REQ_SIZE = 2**14  # 16KB block (stated as optimal in wiki)
 
-    def __init__(self, length):
-        self.append_lock = threading.Lock()
+    def __init__(self, length, sha1):
         self.length = length
+        self.sha1 = sha1
         if self.length % self.REQ_SIZE:
             self.nr_blocks = self.length // self.REQ_SIZE + 1
+            modify_last_block = True
         else:
             self.nr_blocks = self.length // self.REQ_SIZE
+            modify_last_block = False
         self.blocks = [Block(self.REQ_SIZE, self.REQ_SIZE * i) for i in range(self.nr_blocks)]
+        if modify_last_block:
+            self.blocks[-1].length -= self.length - (self.length % self.REQ_SIZE)
         self.left = self.length
         self.is_complete = False
 
@@ -202,21 +207,86 @@ class Piece:
         return {block for block in self.blocks if block.state == block.MISSING}
 
     def pending_blocks(self):
-        return {block for block in self.blocks if block.state == block.PENDING}
+        return {block for block in self.blocks if block.state == block.PROCESSING}
 
     def is_complete(self):
         return all(block.state == block.COMPLETE for block in self.blocks)
 
-    def append_data(self, data: bytes):
-        with self.append_lock:
-            self.data.extend(data)
-            self.offset += len(data)
-            self.left -= len(data)
-            if self.offset == self.length:
-                self.is_complete = True
-                return
-            if self.left < self.req_size:
-                self.req_size = self.left
+    def complete_raw_data(self):
+        data = bytearray()
+        for block in self.blocks:
+            data.extend(block.data)
+        return data
+
+    def check_integrity(self):
+        return hashlib.sha1(self.complete_raw_data()).digest() == self.sha1
+
+
+class AutoFillQueue(queue.Queue):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cb = None
+
+    def connect(self, callback):
+        self.cb = callback
+
+    def get(self, *args, **kwargs):
+        if self.empty():
+            self.put(self.cb())
+        return super().get(*args, **kwargs)
+
+
+class PieceManager(threading.Thread):
+
+    def __init__(self, pieces: dict, *args,
+                 pieces_data_queue=None,
+                 pieces_info_queue=None,
+                 **kwargs):
+
+        super().__init__(*args, **kwargs)
+        self.pieces = pieces
+        self.pieces_data_queue = pieces_data_queue
+        self.pieces_info_queue = pieces_info_queue
+        if self.pieces_info_queue is not None:
+            self.pieces_info_queue.connect(self.get_piece_info_for_request)
+        self.pieces_lock = threading.Lock()
+        self.current_piece_ind = 0
+        self._terminate = False
+
+    # def get_pieces_of_interest(self):
+    #     return {piece for piece in self.pieces if not piece.is_complete}
+
+    def set_queues(self, pieces_data_queue, pieces_info_queue):
+        self.pieces_data_queue = pieces_data_queue
+        self.pieces_info_queue = pieces_info_queue
+        self.pieces_info_queue.connect(self.get_piece_info_for_request)
+
+    def get_piece_info_for_request(self):
+        with self.pieces_lock:
+            piece_of_interest = self.pieces[self.current_piece_ind]
+            for block in piece_of_interest.blocks:
+                if block.MISSING:
+                    return self.current_piece_ind, block.offset, block.length
+
+    def run(self):
+        if not self.pieces_info_queue or not self.pieces_data_queue:
+            raise RuntimeError('Queues for piece management not set!')
+        while not self._terminate:
+            piece_ind, block_offset, block_data = self.pieces_data_queue.get()
+            with self.pieces_lock:
+                piece = self.pieces[piece_ind]
+                for block in self.pieces[piece_ind]:
+                    if block_offset == block.offset:
+                        block.fill_block_with_data(block_data)
+                        break
+                    if piece.is_complete() and piece.check_integrity():
+                        self.current_piece_ind += 1
+
+    # def run(self):
+    #     while not self._terminate:
+    #         for piece in self.get_pieces_of_interest():
+    #             pass
 
 
 class Torrent:
@@ -236,13 +306,12 @@ class Torrent:
             )
         }
         self.actual_data = {
-            piece_ind: Piece(int(self.info[b'piece length'])) for
-            piece_ind in self.piece_length
+            piece_ind: Piece(int(self.info[b'piece length']),
+                             self.sha_pieces[piece_ind]) for
+            piece_ind in range(len(self.piece_length))
         }
-        # print(self.data)
 
-    def get_piece_info_for_request(self):
-        pass
+        self.pieces_manager = PieceManager(self.actual_data)
 
     def decode_torrent(self):
         """Returns decoded torrent metainfo as python types"""
@@ -319,7 +388,7 @@ class Torrent:
     def left(self):
         return self._data_left
 
-    def verify_piece(self, piece, piece_ind):
-        """Verify assembled piece integrity"""
-        assert hashlib.sha1(piece).digest == self.sha_pieces[piece_ind]
+    # def verify_piece(self, piece, piece_ind):
+    #     """Verify assembled piece integrity"""
+    #     assert hashlib.sha1(piece).digest() == self.sha_pieces[piece_ind]
 
