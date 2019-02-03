@@ -3,7 +3,6 @@
 ###Main Functionality:
   * Downloading
   * Port configuration
-  * Different layouts of downloads/uploads
   * Adequate progress bar
   
 ###Optional Functionality:
