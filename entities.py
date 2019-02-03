@@ -1,4 +1,5 @@
 import sys
+import json
 import time
 import queue
 import select
@@ -9,67 +10,22 @@ import traceback
 from collections import OrderedDict
 import requests
 
+import utils
 import decoder
-
-
-TORRENTS = []
-TORRENT_TO_MESSAGES = {}
-TORRENT_TO_PEER_QUEUE = {}
-TORRENT_TO_PIECES_INFO_QUEUE = {}
-TORRENT_TO_PIECES_DATA_QUEUE = {}
-
-
-def register_torrent(torrent):
-    """Register torrents in chronological order"""
-    TORRENTS.append(torrent)
-    peer_id = torrent.tracker_info_header['peer_id'].encode('utf-8')
-    info_hash = torrent.tracker_info_header['info_hash']
-    TORRENT_TO_PEER_QUEUE[torrent] = queue.Queue()
-    TORRENT_TO_PIECES_INFO_QUEUE[torrent] = decoder.AutoFillQueue()
-    TORRENT_TO_PIECES_DATA_QUEUE[torrent] = queue.Queue()
-    TORRENT_TO_MESSAGES[torrent] = PeerMessage(peer_id, info_hash)
-
-
-def get_current_torrent():
-    """Get latest registered torrent"""
-    return TORRENTS[-1]
-
-
-def get_torrent_msg_rel():
-    """
-    Use latest torrent from here instead of
-    passing it every time to PeerMessages
-    as a parameter wherever needed in
-    current torrent processing
-    """
-    return TORRENT_TO_MESSAGES[get_current_torrent()]
-
-
-def get_torrent_peers_queue_rel():
-    """Same as above but for peer queue"""
-    return TORRENT_TO_PEER_QUEUE[get_current_torrent()]
-
-
-def get_torrent_pieces_info_queue_rel():
-    """Same as above but for pieces queue"""
-    return TORRENT_TO_PIECES_INFO_QUEUE[get_current_torrent()]
-
-
-def get_torrent_pieces_data_queue_rel():
-    """Same as above but for pieces queue"""
-    return TORRENT_TO_PIECES_DATA_QUEUE[get_current_torrent()]
-
 
 
 class Peer:
 
     MAX_CONN_ATTEMPTS = 3
 
-    def __init__(self, ip, port, sock=None):
+    def __init__(self, ip, port, nr_pieces, sock=None):
         self.ip = ip
         self.port = port
+        self.nr_pieces = nr_pieces
         self._is_valid = None
-        self.bitmap = None
+        self._bitmap = None
+        self._pieces_state = None
+        self.pieces_map = {i: None for i in range(nr_pieces)}
         self.connection_attempts = 0
         self.errors = set()
         if not sock:
@@ -77,6 +33,45 @@ class Peer:
         else:
             self.sock = sock
             self._is_valid = True
+
+        # make it an instance attribute in order for the
+        # current torrent to be registered at this point
+        # and have different transportation instances
+        # for different torrents
+        self.peer_pieces_transport_util = \
+            utils.PiecesPeersTransportFactory.produce(utils.get_current_torrent())
+        self.peer_pieces_transport_util.register(self)
+
+    def set_piece_availability(self, piece_ind, avail=True):
+        self.pieces_map[piece_ind] = avail
+
+    @property
+    def bitmap(self):
+        return self._bitmap
+
+    @bitmap.setter
+    def bitmap(self, bmap):
+        self._bitmap = ''.join(bin(x) for x in bmap).replace('0b', '')
+        for ind, piece in enumerate(self._bitmap[:self.nr_pieces]):
+            self.pieces_map[ind] = bool(int(piece))
+
+    def get_pieces_inds_peer_has(self):
+        return [piece_ind for piece_ind in self.pieces_map
+                if self.pieces_map[piece_ind]]
+
+    def has_piece(self, piece_ind):
+        return self.pieces_map[piece_ind]
+
+    def save_pieces_state(self):
+        self._pieces_state = json.dumps(self.get_pieces_inds_peer_has(),
+                                        sort_keys=True)
+
+    def check_change_in_state(self):
+        if self._pieces_state is None:
+            return False
+        return json.dumps(self.get_pieces_inds_peer_has(),
+                          sort_keys=True) == self._pieces_state
+
 
     def create_client_socket(self):
         """Create socket ready to CONNECT to peers from tracker response"""
@@ -135,6 +130,11 @@ class Peer:
     def is_valid(self):
         return self._is_valid
 
+    # def get_piece_indices_from_bitmap(self):
+    #     if not self.bitmap:
+    #         return
+
+
 
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.poolmanager import PoolManager
@@ -157,7 +157,7 @@ class SourcePortAdapter(HTTPAdapter):
 class Tracker:
 
     def __init__(self, port, compact):
-        self.torrent = get_current_torrent()
+        self.torrent = utils.get_current_torrent()
         self.port = port
         self.compact = compact
         self.session = requests.Session()
@@ -207,12 +207,7 @@ class Client:
 
     def __init__(self, torrent_path):
         self.torrent = decoder.Torrent(torrent_path)
-        register_torrent(self.torrent)
-
-        self.torrent.pieces_manager.set_queues(
-            get_torrent_pieces_data_queue_rel(),
-            get_torrent_pieces_info_queue_rel()
-        )
+        utils.register_torrent(self.torrent, PeerMessage)
 
         self.tracker = Tracker(self.port, self.compact)
         self.peers = []
@@ -247,14 +242,14 @@ class Client:
         """
         Method for initiating all torrent downloading processes
         """
-        self.peers_queue = get_torrent_peers_queue_rel()
+        self.peers_queue = utils.get_torrent_peers_queue_rel()
         self.server_socket_thread.start()
         self.peer_loop.start()
         self.torrent.pieces_manager.start()
 
         tracker_resp = self.tracker.connect()
         parsed = self.parse_tracker_response(tracker_resp.text.encode('utf-8'))
-        peers = [Peer(ip, port[0]) for _, (ip, port)
+        peers = [Peer(ip, port[0], self.torrent.get_nr_of_pieces()) for _, (ip, port)
                  in parsed[b'peers'].items()]
         threading.Thread(target=self.connect_to_peers, args=(peers,)).start()
 
@@ -342,6 +337,7 @@ class Client:
             client_sock, client_addr = serv_sock.accept()
             client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             self.peers_queue.put(Peer(client_addr[0], client_addr[1],
+                                      self.torrent.get_nr_of_pieces(),
                                       sock=client_sock))
 
     def connect_to_peers(self, peer_list):
@@ -384,8 +380,8 @@ class PeerThread(threading.Thread):
 class PeerLoop(threading.Thread):
 
     def __init__(self):
-        self.peer_queue = get_torrent_peers_queue_rel()
-        self.peer_messages = get_torrent_msg_rel()
+        self.peer_queue = utils.get_torrent_peers_queue_rel()
+        self.peer_messages = utils.get_torrent_msg_rel()
         self.processed_peers = {}
         self.message_queues = {}
         self.peer_msg_rel = {}
@@ -476,16 +472,18 @@ class PeerLoop(threading.Thread):
             if not msg_queue.empty():
                 msg_type = msg_queue.get_nowait()
                 msg_inst = msg_type()
+                if isinstance(msg_inst, Request):
+                    print('e sho tei we')
                 peer.send(msg_inst)
-            else:
-                try:
-                    peer.send(Handshake(self.peer_messages.peer_id,
-                                        self.peer_messages.info_hash).encode())
-                    # peer.send(Interested().encode())
-                    # peer.send(Request().encode())
-                except socket.error as e:
-                    print('There was an exception:', str(e))
-                    self.runtime_removal(peer_sock, error_sockets)
+            # else:
+                # try:
+                #     peer.send(Handshake(self.peer_messages.peer_id,
+                #                         self.peer_messages.info_hash).encode())
+                #     peer.send(Interested().encode())
+                #     peer.send(Request().encode())
+                # except socket.error as e:
+                #     print('There was an exception:', str(e))
+                #     self.runtime_removal(peer_sock, error_sockets)
 
             # if not is_valid:
             #     self.runtime_removal(peer_sock, err)
@@ -493,7 +491,7 @@ class PeerLoop(threading.Thread):
             # if payload:
             #     data_to_send = msg.next_msg()
 
-            time.sleep(1)
+            time.sleep(0.1)
 
     def peer_communication_handler(self):
         print('starteeeed')
@@ -511,10 +509,10 @@ class PeerLoop(threading.Thread):
 
     def _reader_loop(self):
         while not self._terminate:
-            try:
-                new_peer = self.peer_queue.get()
-            except queue.Empty:
-                continue
+            # try:
+            new_peer = self.peer_queue.get()
+            # except queue.Empty:
+            #     continue
 
             if new_peer not in self.processed_peers:
                 print('new peer')
@@ -549,8 +547,7 @@ class PeerMessage:
     def __init__(self, peer_id=None, info_hash=None):
         self.peer_id = peer_id
         self.info_hash = info_hash
-        self.pieces_data_queue = get_torrent_pieces_data_queue_rel()
-        self.pieces_info_queue = get_torrent_pieces_info_queue_rel()
+        self.pieces_manager = utils.get_current_pieces_manager()
         self.initial_len = None
         self.msg_len = None
         self.msg_buffer = bytearray()
@@ -601,9 +598,10 @@ class PeerMessage:
 
 class Handshake(PeerMessage):
 
+    handshake_sent_peers = set()
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.handshake_sent = False
 
     def encode(self):
         pstrlen = struct.pack('!B', 19)
@@ -614,16 +612,16 @@ class Handshake(PeerMessage):
         )
         return handshake
 
-    def decode(self, *args, **kwargs):
+    def decode(self, peer, *args, **kwargs):
         if not self.complete_msg[28: 48] == self.encode()[28: 48]:
             return False, None
-        return True, lambda: self.next_step()
+        return True, lambda: self.next_step(peer)
 
-    def next_step(self, *args, **kwargs):
-        # if not self.handshake_sent:
-        #     self.handshake_sent = True
-        #     return self.encode()
-        return Request().encode(*self.pieces_info_queue.get())
+    def next_step(self, peer, *args, **kwargs):
+        if peer not in self.handshake_sent_peers:
+            self.handshake_sent_peers.add(peer)
+            return self.encode()
+        return Request().encode(*self.pieces_manager.pieces_info_queue.get())
 
     @staticmethod
     def get_len(msg):
@@ -712,13 +710,16 @@ class Have(PeerMessage):
         payload = struct.pack('!I', piece_index)
         return len_id + payload
 
-    def decode(self, *args, **kwargs):
+    def decode(self, peer, *args, **kwargs):
         _, _, index = struct.unpack('!IBI', self.complete_msg)
-        return True, lambda: self.next_step(index)
+        peer.set_piece_availability(index)
+        return True, lambda: self.next_step(peer)
 
-    def next_step(self, piece_ind):
+    def next_step(self, peer):
         # TODO: let's continue from here, shall we
-        return Request(piece_ind)
+        return Request().encode(
+            *self.pieces_manager.get_piece_info_for_request(peer=peer)
+        )
 
 
 class Bitfield(PeerMessage):
@@ -730,10 +731,12 @@ class Bitfield(PeerMessage):
     def decode(self, peer, *args, **kwargs):
         bitmap = ''.join(bin(x) for x in self.complete_msg[5:]).replace('0b', '')
         peer.bitmap = {ind: bool(int(val)) for ind, val in enumerate(bitmap)}
-        return True, lambda: self.next_step()
+        return True, lambda: self.next_step(peer)
 
-    def next_step(self, *args, **kwargs):
-        return Request().encode(*self.pieces_info_queue.get())
+    def next_step(self, peer, *args, **kwargs):
+        return Request().encode(
+            *self.pieces_manager.get_piece_info_for_request(peer=peer)
+        )
 
 
 class Request(PeerMessage):
@@ -749,8 +752,8 @@ class Request(PeerMessage):
         payload = struct.pack('!III', index, begin, length)
         return len_id + payload
 
-    def decode(self, msg):
-        _, _, index, begin, length = struct.unpack('!IBIII', msg)
+    def decode(self, peer, *args, **kwargs):
+        _, _, index, begin, length = struct.unpack('!IBIII', self.complete_msg)
 
     def next_step(self, *args, **kwargs):
         pass
@@ -763,14 +766,17 @@ class Piece(PeerMessage):
         payload = struct.pack('II', index, begin) + block
         return len_id + payload
 
-    def decode(self, msg):
-        _, _, index, offset = struct.unpack('!IBII', msg[:13])
-        block = msg[13:]
-        self.pieces_data_queue.put((index, offset, block))
-        return True, lambda: self.next_step()
+    def decode(self, peer, *args, **kwargs):
+        _, _, index, offset = struct.unpack('!IBII', self.complete_msg[:13])
+        block = self.complete_msg[13:]
+        self.pieces_manager.pieces_data_queue.put((index, offset, block))
+        return True, lambda: self.next_step(peer)
 
-    def next_step(self, *args, **kwargs):
-        return Have().encode()
+    def next_step(self, peer, *args, **kwargs):
+        latest_full_piece_ind = self.pieces_manager.pieces_have_queue.get_nowait()
+        if not latest_full_piece_ind:
+            Request().encode(*self.pieces_manager.get_piece_info_for_request(peer=peer))
+        return Have().encode(latest_full_piece_ind)
 
 
 if __name__ == '__main__':

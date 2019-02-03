@@ -3,6 +3,7 @@ import random
 import hashlib
 import threading
 from collections import OrderedDict
+from utils import PiecesPeersTransportFactory
 
 
 class UnrecognizedTokenError(Exception):
@@ -201,7 +202,6 @@ class Piece:
         if modify_last_block:
             self.blocks[-1].length -= self.length - (self.length % self.REQ_SIZE)
         self.left = self.length
-        self.is_complete = False
 
     def missing_blocks(self):
         return {block for block in self.blocks if block.state == block.MISSING}
@@ -210,8 +210,9 @@ class Piece:
         return {block for block in self.blocks if block.state == block.PROCESSING}
 
     def is_complete(self):
-        return all(block.state == block.COMPLETE for block in self.blocks)
+        return all(block.state == block.COMPLETE for block in self.blocks) and self.check_integrity()
 
+    @property
     def complete_raw_data(self):
         data = bytearray()
         for block in self.blocks:
@@ -231,57 +232,83 @@ class AutoFillQueue(queue.Queue):
     def connect(self, callback):
         self.cb = callback
 
-    def get(self, *args, **kwargs):
+    def get(self, *args, piece_ind=None, peer=None, **kwargs):
         if self.empty():
-            self.put(self.cb())
+            self.put(self.cb(piece_ind, peer))
         return super().get(*args, **kwargs)
 
 
 class PieceManager(threading.Thread):
 
-    def __init__(self, pieces: dict, *args,
+    def __init__(self, torrent, pieces: dict, *args,
                  pieces_data_queue=None,
-                 pieces_info_queue=None,
+                 pieces_have_queue=None,
                  **kwargs):
 
         super().__init__(*args, **kwargs)
         self.pieces = pieces
         self.pieces_data_queue = pieces_data_queue
-        self.pieces_info_queue = pieces_info_queue
-        if self.pieces_info_queue is not None:
-            self.pieces_info_queue.connect(self.get_piece_info_for_request)
+        self.pieces_have_queue = pieces_have_queue
+        self.peers_pieces_queues = PiecesPeersTransportFactory.produce(torrent)
         self.pieces_lock = threading.Lock()
         self.current_piece_ind = 0
         self._terminate = False
 
-    # def get_pieces_of_interest(self):
-    #     return {piece for piece in self.pieces if not piece.is_complete}
+    def terminate(self):
+        self._terminate = True
 
-    def set_queues(self, pieces_data_queue, pieces_info_queue):
-        self.pieces_data_queue = pieces_data_queue
-        self.pieces_info_queue = pieces_info_queue
-        self.pieces_info_queue.connect(self.get_piece_info_for_request)
-
-    def get_piece_info_for_request(self):
+    def get_piece_info_for_request(self, piece_ind=None, peer=None):
         with self.pieces_lock:
-            piece_of_interest = self.pieces[self.current_piece_ind]
-            for block in piece_of_interest.blocks:
-                if block.MISSING:
-                    return self.current_piece_ind, block.offset, block.length
+            # if piece_ind:
+            #     piece_of_interest = self.pieces[piece_ind]
+            # else:
+            #     piece_of_interest = self.pieces[self.current_piece_ind]
+            # if piece_of_interest.is_complete() and not piece_ind:
+            #     self.current_piece_ind += 1
+            #     return self.get_piece_info_for_request(piece_ind)
+            # for block in piece_of_interest.blocks:
+            #     if block.MISSING:
+            #         return self.current_piece_ind, block.offset, block.length
+            return self.peers_pieces_queues[peer].get()
 
     def run(self):
-        if not self.pieces_info_queue or not self.pieces_data_queue:
+        if any(q is None for q in (self.pieces_data_queue,
+                                   self.pieces_have_queue)):
             raise RuntimeError('Queues for piece management not set!')
         while not self._terminate:
-            piece_ind, block_offset, block_data = self.pieces_data_queue.get()
-            with self.pieces_lock:
-                piece = self.pieces[piece_ind]
-                for block in self.pieces[piece_ind]:
-                    if block_offset == block.offset:
-                        block.fill_block_with_data(block_data)
-                        break
-                    if piece.is_complete() and piece.check_integrity():
-                        self.current_piece_ind += 1
+            try:
+                data = self.pieces_data_queue.get(False)
+            except queue.Empty:
+                # print('No data in peer queue atm')
+                pass
+            else:
+                piece_ind, block_offset, block_data = data
+                with self.pieces_lock:
+                    piece = self.pieces[piece_ind]
+                    for block in self.pieces[piece_ind]:
+                        if block_offset == block.offset:
+                            block.fill_block_with_data(block_data)
+                            break
+                        if piece.is_complete():
+                            print(piece, piece.complete_raw_data)
+                            self.current_piece_ind += 1
+                            self.pieces_have_queue.put(piece_ind)
+
+            with self.peers_pieces_queues.lock:
+                for peer in self.peers_pieces_queues:
+                    piece_queue = self.peers_pieces_queues[peer]
+                    for piece_ind in peer.get_pieces_inds_peer_has():
+                        piece = self.pieces[piece_ind]
+                        if not piece.is_complete():
+                            for block in piece.missing_blocks():
+                                try:
+                                    piece_queue.put((piece_ind, block.offset, block.length))
+                                except queue.Full:
+                                    break
+                            break
+
+
+
 
     # def run(self):
     #     while not self._terminate:
@@ -308,10 +335,17 @@ class Torrent:
         self.actual_data = {
             piece_ind: Piece(int(self.info[b'piece length']),
                              self.sha_pieces[piece_ind]) for
-            piece_ind in range(len(self.piece_length))
+            piece_ind in range(len(self.sha_pieces))
         }
 
-        self.pieces_manager = PieceManager(self.actual_data)
+        self.pieces_manager = PieceManager(
+            self,
+            self.actual_data,
+            pieces_data_queue=queue.Queue(),
+            pieces_have_queue=queue.Queue()
+        )
+
+
 
     def decode_torrent(self):
         """Returns decoded torrent metainfo as python types"""
@@ -323,6 +357,9 @@ class Torrent:
 
     def encode_torrent(self, data):
         return OrderedEncoder(data).encode()
+
+    def get_nr_of_pieces(self):
+        return len(self.sha_pieces)
 
     def get_files_length(self):
         return sum(int(x[b'length']) for x in self.data[b'info'][b'files'])
